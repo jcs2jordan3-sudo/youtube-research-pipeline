@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Data (generated output)
+data/raw/
+data/processed/
+data/notebooklm/
+data/notion/
+data/obsidian/
+data/manifest.json
+data/failed_urls.txt
+
+# Logs
+logs/
+
+# Audio files
+*.mp3
+*.m4a
+*.webm
+*.opus
+*.wav
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OMC state
+.omc/

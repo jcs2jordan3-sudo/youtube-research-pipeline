@@ -1,0 +1,8 @@
+yt-dlp>=2024.1.0
+youtube-transcript-api>=1.0.0
+python-dotenv>=1.0.0
+requests>=2.28.0
+faster-whisper>=1.0.0
+
+# Optional: LLM summarization via Claude API
+# anthropic>=0.40.0
