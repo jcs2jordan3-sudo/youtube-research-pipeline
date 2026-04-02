@@ -320,7 +320,7 @@ def _llm_detailed(transcript: TranscriptResult, meta: VideoMetadata) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Notion: create role page + DB + upload rows
+# Notion: role folder + daily page + DB + upload rows
 # ---------------------------------------------------------------------------
 
 def _format_date_iso(raw: str) -> str:
@@ -329,18 +329,83 @@ def _format_date_iso(raw: str) -> str:
     return raw
 
 
-def create_role_page_with_db(
+def _find_or_create_role_folder(
     api_key: str,
     parent_page_id: str,
+    role_name: str,
+    emoji: str,
+) -> str | None:
+    """Find existing role folder page under parent, or create one.
+
+    Searches children of parent_page_id for a page titled "{emoji} {role_name}".
+    Returns the role folder page ID, or None on failure.
+    """
+    folder_title = f"{emoji} {role_name}"
+
+    # Search existing children for the role folder
+    cursor: str | None = ""
+    while cursor is not None:
+        url = f"https://api.notion.com/v1/blocks/{parent_page_id}/children?page_size=100"
+        if cursor:
+            url += f"&start_cursor={cursor}"
+        try:
+            resp = _notion_request("GET", url, api_key)
+            if resp.status_code != 200:
+                logger.warning("[%s] Failed to list children: %d", role_name, resp.status_code)
+                break
+            data = resp.json()
+            for block in data.get("results", []):
+                if block.get("type") == "child_page":
+                    block_title = block.get("child_page", {}).get("title", "")
+                    if block_title == folder_title:
+                        logger.info("[%s] Found existing role folder: %s", role_name, block["id"])
+                        return block["id"]
+            cursor = data.get("next_cursor")
+        except Exception as e:
+            logger.warning("[%s] Error searching children: %s", role_name, e)
+            break
+
+    # Not found — create new role folder page
+    page_body = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "icon": {"type": "emoji", "emoji": emoji},
+        "properties": {"title": {"title": _build_rich_text(folder_title)}},
+        "children": [
+            _build_paragraph_block(f"{role_name} 직군의 일일 YouTube 리서치 결과가 날짜별로 정리됩니다."),
+        ],
+    }
+
+    try:
+        resp = _notion_request("POST", "https://api.notion.com/v1/pages", api_key, json_body=page_body)
+        if resp.status_code != 200:
+            logger.error("[%s] Role folder creation failed: %d — %s", role_name, resp.status_code, resp.text[:300])
+            return None
+        folder_id = resp.json()["id"]
+        logger.info("[%s] Created role folder: %s (id=%s)", role_name, folder_title, folder_id)
+        return folder_id
+    except Exception as e:
+        logger.error("[%s] Role folder error: %s", role_name, e)
+        return None
+
+
+def create_daily_page_with_db(
+    api_key: str,
+    role_folder_id: str,
     role_name: str,
     emoji: str,
     keywords: list[str],
     video_count: int,
 ) -> tuple[str | None, str | None]:
-    """Create a role page with keyword summary + DB inside."""
+    """Create a daily research page with DB inside the role folder.
+
+    Structure:
+        {emoji} {role_name} (role folder — persistent)
+            └── Daily Research_MMDD (daily page — created each run)
+                    └── 📊 영상 목록 (DB with video rows)
+    """
     today = datetime.now().strftime("%m%d")
     today_full = datetime.now().strftime("%Y-%m-%d")
-    page_title = f"{emoji} {role_name} Daily Research_{today}"
+    page_title = f"Daily Research_{today}"
 
     kw_text = ", ".join(keywords)
     criteria = (
@@ -350,8 +415,8 @@ def create_role_page_with_db(
     )
 
     page_body = {
-        "parent": {"type": "page_id", "page_id": parent_page_id},
-        "icon": {"type": "emoji", "emoji": emoji},
+        "parent": {"type": "page_id", "page_id": role_folder_id},
+        "icon": {"type": "emoji", "emoji": "📅"},
         "properties": {"title": {"title": _build_rich_text(page_title)}},
         "children": [
             _build_heading_block("검색 기준", level=3),
@@ -362,14 +427,14 @@ def create_role_page_with_db(
     try:
         resp = _notion_request("POST", "https://api.notion.com/v1/pages", api_key, json_body=page_body)
         if resp.status_code != 200:
-            logger.error("[%s] Page creation failed: %d", role_name, resp.status_code)
+            logger.error("[%s] Daily page creation failed: %d", role_name, resp.status_code)
             return None, None
         page_id = resp.json()["id"]
     except Exception as e:
-        logger.error("[%s] Page error: %s", role_name, e)
+        logger.error("[%s] Daily page error: %s", role_name, e)
         return None, None
 
-    # Create DB inside the page
+    # Create DB inside the daily page
     db_body = {
         "parent": {"type": "page_id", "page_id": page_id},
         "icon": {"type": "emoji", "emoji": "📊"},
@@ -392,7 +457,7 @@ def create_role_page_with_db(
             logger.error("[%s] DB creation failed: %d — %s", role_name, resp.status_code, resp.text[:200])
             return page_id, None
         db_id = resp.json()["id"]
-        logger.info("[%s] Created page+DB: %s", role_name, page_title)
+        logger.info("[%s] Created daily page+DB: %s", role_name, page_title)
         return page_id, db_id
     except Exception as e:
         logger.error("[%s] DB error: %s", role_name, e)
@@ -513,10 +578,16 @@ def run_role_research(
         for i, v in enumerate(selected, 1):
             print(f"    {i}. [{v['view_count']:,}] {v['title'][:50]}")
 
-        # Step 2: Create Notion page + DB
-        print(f"  Notion 페이지 생성...")
-        page_id, db_id = create_role_page_with_db(
-            api_key, parent_page_id, role_name, emoji, keywords, len(selected)
+        # Step 2: Find/create role folder, then create daily page + DB
+        print(f"  Notion 직군 폴더 확인...")
+        role_folder_id = _find_or_create_role_folder(api_key, parent_page_id, role_name, emoji)
+        if not role_folder_id:
+            print(f"  직군 폴더 생성 실패. 스킵.")
+            continue
+
+        print(f"  Notion 데일리 페이지 생성...")
+        page_id, db_id = create_daily_page_with_db(
+            api_key, role_folder_id, role_name, emoji, keywords, len(selected)
         )
         if not db_id:
             print(f"  Notion DB 생성 실패. 스킵.")
@@ -556,6 +627,244 @@ def run_role_research(
     print(f"{'='*60}\n")
 
 
+# ---------------------------------------------------------------------------
+# Migration: move existing flat pages into role folders
+# ---------------------------------------------------------------------------
+
+def _read_block_children(api_key: str, block_id: str) -> list[dict]:
+    """Read all child blocks of a page/block (handles pagination)."""
+    children: list[dict] = []
+    cursor: str | None = ""
+    while cursor is not None:
+        url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
+        if cursor:
+            url += f"&start_cursor={cursor}"
+        try:
+            resp = _notion_request("GET", url, api_key)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            children.extend(data.get("results", []))
+            cursor = data.get("next_cursor")
+        except Exception:
+            break
+    return children
+
+
+def _clone_block(block: dict) -> dict | None:
+    """Convert a retrieved block into a create-ready block payload.
+
+    Notion API returns blocks with extra metadata; we strip it down
+    to only the fields needed for creating a new block.
+    """
+    btype = block.get("type")
+    if not btype:
+        return None
+
+    # Block types that can be cloned directly
+    clonable = {
+        "paragraph", "heading_1", "heading_2", "heading_3",
+        "bulleted_list_item", "numbered_list_item", "to_do",
+        "toggle", "quote", "callout", "divider",
+        "table_of_contents", "bookmark", "embed", "image",
+        "video", "file", "pdf", "code", "equation",
+    }
+
+    if btype not in clonable:
+        # For unsupported types (child_page, child_database, etc.), skip
+        return None
+
+    content = block.get(btype)
+    if content is None:
+        return None
+
+    # Remove read-only fields that can't be sent in create requests
+    clean = {}
+    for k, v in content.items():
+        if k in ("children",):
+            continue  # children are handled separately
+        clean[k] = v
+
+    return {
+        "object": "block",
+        "type": btype,
+        btype: clean,
+    }
+
+
+def _clone_page_content(
+    api_key: str,
+    source_page_id: str,
+    target_parent_id: str,
+    title: str,
+    icon_emoji: str = "📅",
+) -> str | None:
+    """Clone a page's content (blocks) into a new page under target_parent_id.
+
+    Returns the new page ID, or None on failure.
+    """
+    # Read source page blocks
+    source_blocks = _read_block_children(api_key, source_page_id)
+
+    # Convert blocks to create-ready payloads
+    new_blocks: list[dict] = []
+    for block in source_blocks:
+        btype = block.get("type")
+
+        # child_database: recreate as a fresh DB with same schema
+        if btype == "child_database":
+            # We can't clone databases block-by-block easily,
+            # so we add a placeholder noting the DB existed
+            new_blocks.append(_build_paragraph_block(
+                f"(원본 데이터베이스: {block.get('child_database', {}).get('title', 'DB')} — "
+                f"영상 데이터는 원본 DB 참조)"
+            ))
+            continue
+
+        cloned = _clone_block(block)
+        if cloned:
+            new_blocks.append(cloned)
+
+    # Create new page
+    page_body = {
+        "parent": {"type": "page_id", "page_id": target_parent_id},
+        "icon": {"type": "emoji", "emoji": icon_emoji},
+        "properties": {"title": {"title": _build_rich_text(title)}},
+    }
+    if new_blocks:
+        page_body["children"] = new_blocks[:100]
+
+    try:
+        resp = _notion_request("POST", "https://api.notion.com/v1/pages", api_key, json_body=page_body)
+        if resp.status_code != 200:
+            logger.error("Failed to clone page '%s': %d — %s", title, resp.status_code, resp.text[:300])
+            return None
+        new_page_id = resp.json()["id"]
+
+        # Append remaining blocks if > 100
+        if len(new_blocks) > 100:
+            endpoint = f"https://api.notion.com/v1/blocks/{new_page_id}/children"
+            for i in range(100, len(new_blocks), 100):
+                batch = new_blocks[i:i + 100]
+                _notion_request("PATCH", endpoint, api_key, json_body={"children": batch})
+
+        return new_page_id
+    except Exception as e:
+        logger.error("Clone error for '%s': %s", title, e)
+        return None
+
+
+def _archive_page(api_key: str, page_id: str) -> bool:
+    """Archive (soft-delete) a Notion page."""
+    try:
+        resp = _notion_request(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            api_key,
+            json_body={"archived": True},
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def migrate_to_role_folders(parent_page_id: str = "") -> None:
+    """Migrate existing flat role pages into role folder structure.
+
+    Finds pages like "🎨 아트 Daily Research_0402" directly under
+    parent_page_id and moves them into "🎨 아트" folder pages.
+
+    Process for each matched page:
+        1. Find/create the role folder
+        2. Clone page content into a new page under the role folder
+        3. Archive the original page
+    """
+    api_key = os.getenv("NOTION_API_KEY", "")
+    parent_page_id = parent_page_id or os.getenv("NOTION_PARENT_PAGE_ID", "")
+
+    if not api_key or not parent_page_id:
+        print("NOTION_API_KEY 또는 NOTION_PARENT_PAGE_ID가 설정되지 않았습니다.")
+        return
+
+    print(f"\n{'='*60}")
+    print(f" 마이그레이션: 기존 페이지 → 직군별 폴더 구조")
+    print(f"{'='*60}\n")
+
+    # Build lookup: emoji+role_name → role_name, emoji
+    role_lookup: list[tuple[str, str, str]] = []
+    for role_name, config in ROLES.items():
+        emoji = config["emoji"]
+        prefix = f"{emoji} {role_name} Daily Research_"
+        role_lookup.append((prefix, role_name, emoji))
+
+    # List all children of parent page
+    print("부모 페이지 하위 블록 조회 중...")
+    children = _read_block_children(api_key, parent_page_id)
+
+    # Find pages matching role patterns
+    pages_to_migrate: list[tuple[dict, str, str, str]] = []  # (block, title, role_name, emoji)
+    for block in children:
+        if block.get("type") != "child_page":
+            continue
+        title = block.get("child_page", {}).get("title", "")
+        for prefix, role_name, emoji in role_lookup:
+            if title.startswith(prefix):
+                pages_to_migrate.append((block, title, role_name, emoji))
+                break
+
+    if not pages_to_migrate:
+        print("이동할 페이지가 없습니다. (이미 정리되었거나 매칭되는 페이지 없음)")
+        return
+
+    print(f"이동 대상: {len(pages_to_migrate)}개 페이지\n")
+    for _, title, role_name, _ in pages_to_migrate:
+        print(f"  - {title}  →  {role_name} 폴더")
+
+    # Process each page
+    print()
+    migrated = 0
+    failed = 0
+    role_folder_cache: dict[str, str] = {}  # role_name → folder_id
+
+    for block, title, role_name, emoji in pages_to_migrate:
+        old_page_id = block["id"]
+        print(f"[이동] {title}")
+
+        # Find/create role folder (cached)
+        if role_name not in role_folder_cache:
+            folder_id = _find_or_create_role_folder(api_key, parent_page_id, role_name, emoji)
+            if not folder_id:
+                print(f"  ✗ 직군 폴더 생성 실패")
+                failed += 1
+                continue
+            role_folder_cache[role_name] = folder_id
+        folder_id = role_folder_cache[role_name]
+
+        # New title: strip the emoji+role prefix → just "Daily Research_MMDD"
+        prefix = f"{emoji} {role_name} "
+        new_title = title[len(prefix):] if title.startswith(prefix) else title
+
+        # Clone page content to role folder
+        new_page_id = _clone_page_content(api_key, old_page_id, folder_id, new_title)
+        if not new_page_id:
+            print(f"  ✗ 복제 실패")
+            failed += 1
+            continue
+
+        # Archive original
+        archived = _archive_page(api_key, old_page_id)
+        if archived:
+            print(f"  ✓ → {emoji} {role_name}/{new_title} (원본 보관처리)")
+            migrated += 1
+        else:
+            print(f"  △ 복제 완료, 원본 보관처리 실패 (수동 삭제 필요)")
+            migrated += 1
+
+    print(f"\n{'='*60}")
+    print(f" 마이그레이션 완료: {migrated} 이동 / {failed} 실패")
+    print(f"{'='*60}\n")
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Role-based YouTube Daily Research")
@@ -564,12 +873,16 @@ if __name__ == "__main__":
     parser.add_argument("--count", type=int, default=5, help="Videos per role")
     parser.add_argument("--no-whisper", action="store_true")
     parser.add_argument("--whisper-model", type=str, default="base")
+    parser.add_argument("--migrate", action="store_true", help="Migrate existing flat pages into role folders")
     args = parser.parse_args()
 
-    run_role_research(
-        parent_page_id=args.page_id,
-        days=args.days,
-        videos_per_role=args.count,
-        whisper=not args.no_whisper,
-        whisper_model=args.whisper_model,
-    )
+    if args.migrate:
+        migrate_to_role_folders(parent_page_id=args.page_id)
+    else:
+        run_role_research(
+            parent_page_id=args.page_id,
+            days=args.days,
+            videos_per_role=args.count,
+            whisper=not args.no_whisper,
+            whisper_model=args.whisper_model,
+        )
