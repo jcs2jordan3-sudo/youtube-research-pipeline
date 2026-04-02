@@ -76,6 +76,253 @@ def _build_transcript_excerpt(transcript: TranscriptResult, max_segments: int = 
     return "\n".join(lines)
 
 
+def _build_toggle_block(title: str, children: list[dict]) -> dict:
+    """Build a Notion toggle block (collapsible)."""
+    return {
+        "object": "block",
+        "type": "toggle",
+        "toggle": {
+            "rich_text": _build_rich_text(title),
+            "children": children,
+        },
+    }
+
+
+def _build_full_transcript_toggles(transcript: TranscriptResult) -> list[dict]:
+    """Build toggle blocks containing the full transcript, chunked to fit Notion limits."""
+    if transcript.status != TranscriptStatus.SUCCESS or not transcript.segments:
+        return [_build_paragraph_block("(자막/음성 데이터 없음)")]
+
+    source_label = "Whisper STT" if transcript.is_generated else "YouTube 자막"
+    total = len(transcript.segments)
+
+    # Build full transcript text in chunks (each paragraph max ~1900 chars)
+    all_lines: list[str] = []
+    for seg in transcript.segments:
+        ts = format_timestamp(seg.start)
+        text = seg.text.strip()
+        if text:
+            all_lines.append(f"[{ts}] {text}")
+
+    # Split into paragraph blocks of ~1900 chars each
+    child_blocks: list[dict] = []
+    chunk: list[str] = []
+    chunk_len = 0
+    for line in all_lines:
+        if chunk_len + len(line) + 1 > 1900 and chunk:
+            child_blocks.append(_build_paragraph_block("\n".join(chunk)))
+            chunk = []
+            chunk_len = 0
+        chunk.append(line)
+        chunk_len += len(line) + 1
+    if chunk:
+        child_blocks.append(_build_paragraph_block("\n".join(chunk)))
+
+    # Notion toggle children limit: max 100 blocks
+    # If more, nest into multiple toggles
+    if len(child_blocks) <= 100:
+        return [_build_toggle_block(
+            f"📜 전체 자막 보기 ({source_label} | {total}개 세그먼트)",
+            child_blocks[:100],
+        )]
+    else:
+        toggles = []
+        for i in range(0, len(child_blocks), 100):
+            batch = child_blocks[i:i + 100]
+            part_num = i // 100 + 1
+            toggles.append(_build_toggle_block(
+                f"📜 전체 자막 Part {part_num} ({source_label})",
+                batch,
+            ))
+        return toggles
+
+
+def _get_llm_sections(transcript: TranscriptResult, meta: VideoMetadata) -> dict[str, str]:
+    """Get LLM sections, with caching to avoid duplicate API calls."""
+    vid = meta.id
+    if vid in _llm_cache:
+        return _llm_cache[vid]
+    result = _llm_summarize(transcript, meta)
+    if result:
+        _llm_cache[vid] = result
+        return result
+    return {}
+
+
+def _build_key_insights(transcript: TranscriptResult, meta: VideoMetadata) -> str:
+    """Extract key insights — LLM if available, extractive fallback."""
+    if transcript.status != TranscriptStatus.SUCCESS or not transcript.segments:
+        return "(자막/음성 데이터 없음 — 인사이트 추출 불가)"
+
+    llm = _get_llm_sections(transcript, meta)
+    if "핵심 인사이트" in llm:
+        return llm["핵심 인사이트"]
+
+    # Fallback: extractive
+    segments = transcript.segments
+    step = max(1, len(segments) // 10)
+    sampled = [segments[i] for i in range(0, len(segments), step)]
+    key_sentences = [f"• {s.text.strip()}" for s in sampled if len(s.text.strip()) >= 15][:8]
+    if not key_sentences:
+        return "(핵심 인사이트 추출 실패)"
+    source_label = "Whisper STT" if transcript.is_generated else "YouTube 자막"
+    return f"[{source_label} 기반 추출 — LLM 요약 미사용]\n\n" + "\n".join(key_sentences)
+
+
+def _build_practical_applications(transcript: TranscriptResult, meta: VideoMetadata) -> str:
+    """Extract practical applications — LLM if available, keyword fallback."""
+    if transcript.status != TranscriptStatus.SUCCESS or not transcript.segments:
+        return "(자막/음성 데이터 없음 — 실무 적용 포인트 추출 불가)"
+
+    llm = _get_llm_sections(transcript, meta)
+    if "실무 적용 포인트" in llm:
+        return llm["실무 적용 포인트"]
+
+    # Fallback: keyword-based
+    action_keywords = ["방법", "하세요", "해보세요", "추천", "설정", "활용", "적용", "설치", "팁", "자동화", "실전"]
+    actionable = []
+    for seg in transcript.segments:
+        text = seg.text.strip()
+        if len(text) >= 15 and any(kw in text for kw in action_keywords) and len(actionable) < 8:
+            ts = format_timestamp(seg.start)
+            actionable.append(f"• [{ts}] {text}")
+    if not actionable:
+        return "(실무 적용 포인트를 자동 추출하지 못했습니다)"
+    source_label = "Whisper STT" if transcript.is_generated else "YouTube 자막"
+    return f"[{source_label} 기반 추출 — LLM 요약 미사용]\n\n" + "\n".join(actionable)
+
+
+def _get_full_transcript_text(transcript: TranscriptResult, max_chars: int = 12000) -> str:
+    """Collect transcript text, truncated to max_chars."""
+    if transcript.status != TranscriptStatus.SUCCESS or not transcript.segments:
+        return ""
+    lines = []
+    total = 0
+    for s in transcript.segments:
+        text = s.text.strip()
+        if not text:
+            continue
+        if total + len(text) > max_chars:
+            break
+        lines.append(text)
+        total += len(text)
+    return "\n".join(lines)
+
+
+def _llm_summarize(transcript: TranscriptResult, meta: VideoMetadata) -> dict[str, str] | None:
+    """Use OpenAI API to generate structured summary. Returns dict or None."""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.warning("openai package not installed. pip install openai")
+        return None
+
+    transcript_text = _get_full_transcript_text(transcript, max_chars=12000)
+    if not transcript_text:
+        return None
+
+    prompt = f"""다음 YouTube 영상의 자막/음성 텍스트를 분석하여 한국어로 구조화된 요약을 작성하세요.
+
+영상 제목: {meta.title}
+채널: {meta.channel}
+
+자막 텍스트:
+{transcript_text}
+
+다음 형식으로 정확히 작성하세요. 각 섹션을 ###로 구분하세요.
+
+### 주제별 요약
+영상에서 다루는 주제별로 나눠서 정리하세요. 각 주제를 "▶ 주제명:" 형식으로 시작하세요.
+3~6개의 주제로 나눠주세요.
+
+### 핵심 인사이트
+이 영상에서 가장 중요하고 가치 있는 인사이트를 5개 추출하세요.
+단순한 문장 나열이 아니라, 영상이 전달하는 핵심 메시지와 배울 점을 요약하세요.
+"•" 로 시작하세요.
+
+### 실무 적용 포인트
+이 영상의 내용을 실무에 어떻게 적용할 수 있는지 구체적으로 작성하세요.
+실제로 따라할 수 있는 액션 아이템 위주로 3~5개 작성하세요.
+"•" 로 시작하세요.
+
+중요: 영상 내용을 실제로 이해하고 분석한 요약을 작성하세요. 자막 문장을 그대로 복사하지 마세요."""
+
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.choices[0].message.content or ""
+
+        # Parse sections
+        sections: dict[str, str] = {}
+        current_key = ""
+        current_lines: list[str] = []
+        for line in text.splitlines():
+            if line.startswith("### "):
+                if current_key:
+                    sections[current_key] = "\n".join(current_lines).strip()
+                current_key = line[4:].strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+        if current_key:
+            sections[current_key] = "\n".join(current_lines).strip()
+
+        logger.info("LLM summary generated for %s", meta.id)
+        return sections
+
+    except Exception as e:
+        logger.error("LLM summarization failed for %s: %s", meta.id, e)
+        return None
+
+
+def _build_content_summary(transcript: TranscriptResult, meta: VideoMetadata) -> str:
+    """Build a content summary — LLM if available, extractive fallback."""
+    if transcript.status != TranscriptStatus.SUCCESS or not transcript.segments:
+        if meta.description:
+            return meta.description[:1500]
+        return "(자막/음성 데이터 없음 — 내용 요약 불가)"
+
+    # Try LLM summary first
+    llm = _llm_summarize(transcript, meta)
+    if llm and "주제별 요약" in llm:
+        return llm["주제별 요약"]
+
+    # Fallback: extractive
+    segment_count = len(transcript.segments)
+    duration_min = (meta.duration or 0) // 60
+    source_label = "Whisper STT" if transcript.is_generated else "YouTube 자막"
+
+    third = max(1, segment_count // 3)
+    def extract(segs: list, max_c: int = 400) -> str:
+        out, t = [], 0
+        for s in segs:
+            txt = s.text.strip()
+            if len(txt) < 10: continue
+            if t + len(txt) > max_c: break
+            out.append(txt)
+            t += len(txt)
+        return " ".join(out)
+
+    parts = [
+        f"[{source_label} 기반 | {duration_min}분 | {segment_count}개 세그먼트]\n",
+        f"▶ 도입부: {extract(transcript.segments[:third], 500)}\n",
+        f"▶ 본문: {extract(transcript.segments[third:third*2], 500)}\n",
+        f"▶ 마무리: {extract(transcript.segments[third*2:], 400)}",
+    ]
+    return "\n".join(p for p in parts if p).strip()
+
+
+# Cache for LLM results to avoid duplicate calls per video
+_llm_cache: dict[str, dict[str, str]] = {}
+
+
 def build_notion_entry(
     meta: VideoMetadata,
     transcript: TranscriptResult,
@@ -115,22 +362,25 @@ def build_notion_entry(
     }
 
     # Page body blocks
+    content_summary = _build_content_summary(transcript, meta)
+    key_insights = _build_key_insights(transcript, meta)
+    practical_apps = _build_practical_applications(transcript, meta)
     transcript_excerpt = _build_transcript_excerpt(transcript)
-    description_summary = meta.description[:1500] if meta.description else "(설명란 없음)"
+    transcript_toggles = _build_full_transcript_toggles(transcript)
 
     children = [
-        _build_heading_block("영상 요약"),
-        _build_paragraph_block(description_summary),
+        _build_heading_block("영상 내용 요약"),
+        _build_paragraph_block(content_summary),
         _build_heading_block("핵심 인사이트"),
-        _build_paragraph_block("(자막 및 메타데이터 분석 후 작성)"),
+        _build_paragraph_block(key_insights),
+        _build_heading_block("실무 적용 포인트"),
+        _build_paragraph_block(practical_apps),
         _build_heading_block("타임스탬프 하이라이트"),
         _build_paragraph_block(transcript_excerpt),
-        _build_heading_block("실무 적용 포인트"),
-        _build_paragraph_block("(실무에 적용 가능한 포인트 작성)"),
         _build_heading_block("리스크 / 검증 필요"),
         _build_paragraph_block("(검증이 필요한 사항 작성)"),
-        _build_heading_block("자막 발췌"),
-        _build_paragraph_block(transcript_excerpt),
+        _build_heading_block("전체 자막"),
+        *transcript_toggles,
     ]
 
     return {
