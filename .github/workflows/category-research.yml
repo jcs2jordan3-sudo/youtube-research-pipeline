@@ -1,0 +1,33 @@
+name: YouTube AI Category Research
+
+on:
+  schedule:
+    # 매일 오전 9시 KST (UTC 0시)
+    - cron: "0 0 * * *"
+  workflow_dispatch: # 수동 실행 지원
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run category research
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python -u -m app.category_research \
+            --page-id 33609d25c5a180bcab08f8662b65f073 \
+            --count 4 \
+            --no-whisper
