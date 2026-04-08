@@ -216,8 +216,8 @@ def _llm_summarize(transcript: TranscriptResult, meta: VideoMetadata) -> dict[st
         return None
     try:
         from openai import OpenAI
-    except ImportError:
-        logger.warning("openai package not installed. pip install openai")
+    except ImportError as e:
+        logger.warning("openai import failed (%s): %s", type(e).__name__, e)
         return None
 
     transcript_text = _get_full_transcript_text(transcript, max_chars=12000)
@@ -289,9 +289,9 @@ def _build_content_summary(transcript: TranscriptResult, meta: VideoMetadata) ->
             return meta.description[:1500]
         return "(자막/음성 데이터 없음 — 내용 요약 불가)"
 
-    # Try LLM summary first
-    llm = _llm_summarize(transcript, meta)
-    if llm and "주제별 요약" in llm:
+    # Try LLM summary first (uses cache to avoid duplicate API calls per video)
+    llm = _get_llm_sections(transcript, meta)
+    if "주제별 요약" in llm:
         return llm["주제별 요약"]
 
     # Fallback: extractive
